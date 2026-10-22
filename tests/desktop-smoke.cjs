@@ -1,0 +1,78 @@
+const { _electron: electron } = require('playwright');
+const { createServer } = require('node:http');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const fs = require('node:fs/promises');
+async function main() {
+  const server = createServer((req, res) => {
+    if (req.url === '/slow') return;
+    res.writeHead(req.url === '/failure' ? 503 : 200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<html><head><title>FelpAutomations · página de verificação</title></head><body><h1>Navegação funcionando</h1></body></html>');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+  const userData = path.join(process.cwd(), 'artifacts', `smoke-felpautomations-${Date.now()}`);
+  await fs.mkdir(userData, { recursive: true });
+  let app;
+  let appProcess;
+  try {
+    app = await electron.launch({ args: ['.', `--user-data-dir=${userData}`], env, timeout: 60_000 });
+    appProcess = app.process();
+    const page = await app.firstWindow();
+    page.setDefaultTimeout(30_000);
+    page.on('console', message => { if (message.type() === 'error') console.log('Renderer:', message.text()); });
+    await page.getByRole('heading', { name: 'Central de execução' }).waitFor();
+    assert.equal(await page.title(), 'FelpAutomations');
+    await page.waitForFunction(() => { const logo = document.querySelector('.brand-icon'); return logo.complete && logo.naturalWidth > 0; });
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].minimize());
+    assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMinimized()), true);
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].restore());
+    await page.waitForFunction(() => document.visibilityState === 'visible');
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    assert.equal(await page.locator('#run-button').evaluate(button => button.getBoundingClientRect().bottom <= window.innerHeight), true);
+    await page.screenshot({ path: 'artifacts/interface.png', fullPage: true });
+    await page.locator('#url').fill(url);
+    await page.locator('#keep-open').uncheck();
+    await page.locator('#run-button').click();
+    await page.waitForFunction(() => document.querySelector('#run-status').textContent === 'Concluído', { }, { timeout: 60_000 });
+    await page.waitForFunction(() => !document.querySelector('#run-button').disabled);
+    let state = await page.evaluate(() => window.desktop.getState());
+    assert.equal(state.runs[0].title, 'FelpAutomations · página de verificação');
+    assert.equal(state.runs[0].browserOpen, false);
+    await fs.access(state.runs[0].screenshot);
+    await page.screenshot({ path: 'artifacts/execucao.png' });
+    await page.locator('#keep-open').check();
+    await page.locator('#run-button').click();
+    await page.waitForFunction(() => document.querySelector('#run-status').textContent === 'Concluído');
+    state = await page.evaluate(() => window.desktop.getState());
+    assert.equal(state.runs[0].browserOpen, true);
+    assert.equal(await page.locator('#run-button').isDisabled(), true);
+    await page.locator('#stop-button').click();
+    await page.waitForFunction(() => !document.querySelector('#run-button').disabled);
+    await page.locator('#keep-open').uncheck();
+    await page.locator('#url').fill(`${url}/failure`);
+    await page.locator('#run-button').click();
+    await page.waitForFunction(() => document.querySelector('#run-status').textContent === 'Falhou');
+    await page.waitForFunction(() => !document.querySelector('#run-button').disabled);
+    state = await page.evaluate(() => window.desktop.getState());
+    assert.match(state.runs[0].error, /503/);
+    await page.locator('#url').fill(`${url}/slow`);
+    await page.locator('#run-button').click();
+    await page.waitForFunction(() => document.querySelector('#run-status').textContent === 'Em execução');
+    await page.locator('#stop-button').click();
+    await page.waitForFunction(() => document.querySelector('#run-status').textContent === 'Cancelado');
+    await page.waitForFunction(() => !document.querySelector('#run-button').disabled);
+    assert.deepEqual(errors, []);
+    const exited = new Promise(resolve => appProcess.once('exit', resolve));
+    await app.evaluate(({ BrowserWindow }) => { setTimeout(() => BrowserWindow.getAllWindows()[0].close(), 100); });
+    await Promise.race([exited, new Promise((_, reject) => { const timeout = setTimeout(() => reject(new Error('O aplicativo não encerrou após fechar a janela.')), 10_000); timeout.unref(); })]);
+    console.log('Desktop validado: minimizar, restaurar, fechar, navegação real, captura, navegador mantido aberto, HTTP 503 e cancelamento.');
+  } finally {
+    if (app && appProcess.exitCode === null) await app.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });

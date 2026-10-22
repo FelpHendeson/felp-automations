@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+artifacts/
+*.log
+*.lnk
+.env
+.env.*
+!.env.example
